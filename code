@@ -13,7 +13,6 @@ gc()
 ###########################################
 num_time_steps        <- 5000    # Total simulation steps (iterations)
 num_bats              <- 100   # Initial number of bats
-calorie_loss_per_step <- 0.1   # Energy loss per time step when active (metabolic cost)
 move_step             <- 1     # Basic movement distance per time step
 tolerance             <- 0.1   # Spatial threshold for "arrival" and collision checks
 
@@ -113,24 +112,59 @@ for(c_i in 1:n_clusters) {
 }
 
 ####################################
-# 4. Basal Metabolic Rate (BMR) Function
+# 4. Mass Function & Basal Metabolic Rate (BMR) Function
 ####################################
-initialize_bmr <- function(sex, age, repro_status) {
-  base_bmr <- 1.0
-  if(sex == "F" && repro_status == "pregnant") base_bmr <- base_bmr + 0.5
-  if(age > 3) base_bmr <- base_bmr + 0.2
-  if(sex == "M") base_bmr <- base_bmr + 0.1
-  return(base_bmr + runif(1, -0.05, 0.05))
+
+### MASS in grams
+initialize_mass <- function(sex, repro_status) {
+        if(if(sex == "F" && repro_status == "pregnant"){
+          mass <- runif(1, 10,21)
+}
+if(sex == "F" && repro_status == "lactating"){
+   mass <- ruinf(1,4,17.5) 
+}
+if(sex == "F" && repro_status == "not_pregnant"){
+   mass <- ruinf(1,1,21) 
+}
+if(sex == "M") {
+mass <- ruinf(1,1,39)
 }
 
+#### BMR
+
+initialize_bmr <- function(sex, age, repro_status,mass) {
+  base_bmr <- ((0.0801*log(mass) + 0.851)/179)   #BMR in Watts
+
+#could be +60-100 mW random sampling range for pregnant, +47 range mW for lactating females?
+  if(sex == "F" && repro_status == "pregnant") {
+  base_bmr <- base_bmr + runif(1,0.06,0.1)
+}
+  if(sex == "F" && repro_status == "lactating"){
+  base_bmr + 0.47 }
+}
+
+
+
+#################################
+# 5. Cost of Transport Function
+#################################
+initialize_cot <- function(mass,Pf,speed)
+  {
+  COT <- (Pf / ((speed)(mass*0.001))) #in  joules per second
+  COT <- COT*60   #to convert to joules per minute
+  
+}
+
+
+
 ####################################
-# 5. Initialize Bats in the 2D Arena (with Memory)
+# 6. Initialize Bats in the 2D Arena (with Memory)
 ####################################
 set.seed(123)
 sexes <- sample(c("M","F"), num_bats, replace = TRUE)
 ages  <- sample(1:10, num_bats, replace = TRUE)
 repro_status <- ifelse(sexes == "F",
-                       sample(c("pregnant", "not_pregnant"), num_bats, replace = TRUE,
+                       sample(c("pregnant", "not_pregnant","lactating"), num_bats, replace = TRUE,
                               prob = c(0.3, 0.7)),
                        "N/A")
 foraging_strategies <- sample(c("loner", "group_joiner"), num_bats, replace = TRUE)
@@ -141,12 +175,15 @@ bats <- data.frame(
   id = 1:num_bats,
   x  = roost_sites$x[initial_roost_indices] + runif(num_bats, -1, 1),
   y  = roost_sites$y[initial_roost_indices] + runif(num_bats, -1, 1),
+  mass       = mapply(initialize_mass, repro_status)
+  Pf         =  (50.2(mass*0.001)^0.771)/1000  #Flight power in milliwatts, based on (Winter & Helversen 1998)
   alive = TRUE,
-  state = "Emergence",
+  state = "Emergence"
   sex = sexes,
   age = ages,
   reproductive_status = repro_status,
-  BMR = mapply(initialize_bmr, sexes, ages, repro_status),
+  BMR = mapply(initialize_bmr, sexes, ages, repro_status,mass),
+  speed =  (runif(1,min=5, max =9))*60    #meters per minute
   foraging_strategy = foraging_strategies,
   range_of_vision = rep(shared_range_of_vision, num_bats),
   competition_rate = competition_rates,
@@ -165,7 +202,7 @@ for(i in 1:nrow(bats)) {
 }
 
 ##########################################
-# 6. Function: Pick a Cluster for a Bat (Using Memory)
+# 7. Function: Pick a Cluster for a Bat (Using Memory)
 #    (Chooses a foraging patch based on prey availability, distance, competition, and past success)
 ##########################################
 pick_cluster_for_bat <- function(bat_i, bats, cluster_info) {
@@ -209,13 +246,13 @@ pick_cluster_for_bat <- function(bat_i, bats, cluster_info) {
 }
 
 ##########################################
-# 7. Initial Foraging Targets for Each Bat
+# 8. Initial Foraging Targets for Each Bat
 #    (Set each bat's target to the center of its chosen cluster, or remain in place)
 ##########################################
 
 
 ##########################################
-# 8. Movement Function with Random Repulsion 
+# 9. Movement Function with Random Repulsion 
 #    (Movement is influenced by the desired direction toward the target, repulsion from nearby bats, and age-dependent efficiency)
 ##########################################
 move_with_repulsion <- function(i, bats, step, repulsion_radius = 3) {
@@ -244,12 +281,12 @@ move_with_repulsion <- function(i, bats, step, repulsion_radius = 3) {
 }
 
 ##########################################
-# 9. Setup Plot Limits (2D)
+# 10. Setup Plot Limits (2D)
 ##########################################
 plot_lim <- list(xlim = c(0, 50000), ylim = c(0, 50000))
 
 ##########################################
-# 10. Main Simulation Loop (with Memory, Roosting, & Age-Dependent Behavior)
+# 11. Main Simulation Loop (with Memory, Roosting, & Age-Dependent Behavior)
 ##########################################
 
 for(t in 1:num_time_steps) {
