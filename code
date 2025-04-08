@@ -1,346 +1,515 @@
-# Bat Individual-based Model
+###############################################################################
+# 2D Individual-Based Model of Bats with Life-History Traits, Memory, and Roosting
+# (Incorporates Reproductive Cycle, Age-Dependent Behavior, Memory, and Day-Night Cycle)
+###############################################################################
 
-# -------------------------------
-# 3D Individual-Based Model: Bats, Roosts, Foraging Areas with Memory and Roost-Site Fidelity
-# -------------------------------
+# --- Clean Environment & Graphics ---
+rm(list = ls())
+graphics.off()
+gc()
 
-library(rgl)
+###########################################
+# 1. Global Simulation Parameters
+###########################################
+num_time_steps        <- 5000    # Total simulation steps (iterations)
+num_bats              <- 100   # Initial number of bats
+calorie_loss_per_step <- 0.1   # Energy loss per time step when active (metabolic cost)
+move_step             <- 1     # Basic movement distance per time step
+tolerance             <- 0.1   # Spatial threshold for "arrival" and collision checks
 
-# Simulation Parameters (modifiable)
-num_time_steps      <- 720           # Total time steps (minutes; 12 hours)
-num_bats            <- 300           # Number of bats
-calorie_loss        <- 0.5           # Calorie loss per time step (movement cost)
-target_calories     <- 100           # Bats stop foraging when full
-return_time         <- 660           # After 11 hours (660 minutes), bats return to roost
-move_step           <- 1             # Distance moved per time step
-tolerance           <- 0.1           # Tolerance for "arriving" at a target
 
-# New parameters:
-memory_weight       <- 0.7           # Weight given to memory vs. distance when selecting a foraging patch
-roost_fidelity_rate <- 0.8           # Probability a bat sticks with its original roost when returning
-roost_crowd_threshold <- 50          # If a roost has more than this number of bats, it is considered crowded
+# Energy and metabolic rate references
+calorie_death_threshold <- 0    # Energy level at which a bat dies (starvation)
+max_calories_default    <- 300  # Maximum energy a bat can store
 
-# -------------------------------
-# Define Roost Sites in 3D (all at z = 0)
+# Shared sensory range (all bats use the same detection distance)
+shared_range_of_vision <- 20
+
+# Movie saving flag & directory
+movie <- TRUE
+movie_dir <- "movie_frames"
+if(movie && !dir.exists(movie_dir)) dir.create(movie_dir)
+
+###########################################
+# Additional Life-History Parameters
+###########################################
+
+# Age-dependent behavior parameters:
+min_flight_efficiency    <- 0.8  # Minimum movement efficiency for older bats
+min_foraging_efficiency  <- 0.76  # Average foraging efficiency (Stidsholt et al. 2023)
+
+###########################################
+# Day-Night (Roosting) Parameters
+###########################################
+cycle_length <- 541 #9 hours x 60, plus 1 for overnight roosting   
+sunset <- 1       
+sunrise  <- 540      
+
+###########################################
+# 2. Define Roost Sites in 2D
+###########################################
+# Define a single roost site (bats originate and return here)
 roost_sites <- data.frame(
-  x = c(25, 50, 75),
-  y = c(0, 0, 0),
-  z = c(0, 0, 0)
+  x = c(50),
+  y = c(0)
 )
 
-# -------------------------------
-# Define Foraging Areas in 3D: Each area is a cubic volume with a grid of cells.
-set.seed(123)  # For reproducibility
-num_foraging_areas <- 3
-foraging_areas <- list()
-area_size <- 10  # Side length of each cubic foraging area
+###########################################
+# 3. Foraging Area & Random Clusters in 2D
+###########################################
+# Define the foraging area (e.g., x from 0 to 100 and y from 50 to 100)
+foraging_area_bounds <- list(
+  x_range = c(0, 50000),
+  y_range = c(0, 50000)
+)
 
-for(i in 1:num_foraging_areas) {
-  # Random center with y >= 50
-  center_x <- runif(1, min = area_size/2, max = 100 - area_size/2)
-  center_y <- runif(1, min = 50 + area_size/2, max = 100 - area_size/2)
-  center_z <- runif(1, min = area_size/2, max = 100 - area_size/2)
-  
-  area_bounds <- list(
-    x_range = c(center_x - area_size/2, center_x + area_size/2),
-    y_range = c(center_y - area_size/2, center_y + area_size/2),
-    z_range = c(center_z - area_size/2, center_z + area_size/2)
-  )
-  
-  # Create a grid of cells (cell size = 1) within the area.
-  x_cells <- seq(area_bounds$x_range[1], area_bounds$x_range[2], by = 1)
-  y_cells <- seq(area_bounds$y_range[1], area_bounds$y_range[2], by = 1)
-  z_cells <- seq(area_bounds$z_range[1], area_bounds$z_range[2], by = 1)
-  
-  # Each cell gets a prey count randomly between 5 and 15.
-  prey_array <- array(sample(5:15, length(x_cells) * length(y_cells) * length(z_cells), replace = TRUE),
-                      dim = c(length(x_cells), length(y_cells), length(z_cells)),
-                      dimnames = list(x = as.character(x_cells),
-                                      y = as.character(y_cells),
-                                      z = as.character(z_cells)))
-  
-  # Store center of area for targeting.
-  center <- c(center_x, center_y, center_z)
-  
-  foraging_areas[[i]] <- list(bounds = area_bounds, prey = prey_array, center = center)
+x_cells <- seq(foraging_area_bounds$x_range[1], foraging_area_bounds$x_range[2], by = 1)
+y_cells <- seq(foraging_area_bounds$y_range[1], foraging_area_bounds$y_range[2], by = 1)
+
+# Create matrices for prey density and to assign each cell to a cluster.
+foraging_prey <- matrix(0, nrow = length(x_cells), ncol = length(y_cells),
+                        dimnames = list(x = as.character(x_cells), y = as.character(y_cells)))
+cluster_id <- matrix(0, nrow = length(x_cells), ncol = length(y_cells),
+                     dimnames = list(x = as.character(x_cells), y = as.character(y_cells)))
+
+# Set number of foraging clusters (patches) and randomly generate their properties.
+n_clusters <- 16
+cluster_info <- data.frame(
+  id              = 1:n_clusters,
+  center_x        = runif(n_clusters, min = foraging_area_bounds$x_range[1],
+                          max = foraging_area_bounds$x_range[2]),
+  center_y        = runif(n_clusters, min = foraging_area_bounds$y_range[1],
+                          max = foraging_area_bounds$y_range[2]),
+  radius          = runif(n_clusters, min = 1, max = 10),  # Determines patch size
+  total_prey      = 0,   # To be computed below
+  bats_in_cluster = 0,   # Current count of bats in the cluster
+  capacity        = sample(10:20, n_clusters, replace = TRUE)  # Maximum bats allowed per patch
+)
+
+# For each cluster, assign random prey to cells within the cluster's radius.
+for(c_i in 1:n_clusters) {
+  rad <- cluster_info$radius[c_i]
+  cx <- cluster_info$center_x[c_i]
+  cy <- cluster_info$center_y[c_i]
+  for(ix in seq_along(x_cells)) {
+    for(iy in seq_along(y_cells)) {
+      dx <- x_cells[ix] - cx
+      dy <- y_cells[iy] - cy
+      dist <- sqrt(dx^2 + dy^2)
+      if(dist <= rad) {
+        dens <- sample(10:35, 1)
+        foraging_prey[ix, iy] <- foraging_prey[ix, iy] + dens
+        cluster_id[ix, iy] <- c_i
+      }
+    }
+  }
 }
 
-# -------------------------------
-# Initialize Bats in 3D and Their Memory
-set.seed(123)  # For reproducibility
+# Compute total prey available in each cluster.
+for(c_i in 1:n_clusters) {
+  these_cells <- which(cluster_id == c_i, arr.ind = TRUE)
+  total_in_cluster <- sum(foraging_prey[these_cells])
+  cluster_info$total_prey[c_i] <- total_in_cluster
+}
+
+####################################
+# 4. Basal Metabolic Rate (BMR) Function
+####################################
+initialize_bmr <- function(sex, age, repro_status) {
+  base_bmr <- 1.0
+  if(sex == "F" && repro_status == "pregnant") base_bmr <- base_bmr + 0.5
+  if(age > 3) base_bmr <- base_bmr + 0.2
+  if(sex == "M") base_bmr <- base_bmr + 0.1
+  return(base_bmr + runif(1, -0.05, 0.05))
+}
+
+####################################
+# 5. Initialize Bats in the 2D Arena (with Memory)
+####################################
+set.seed(123)
+sexes <- sample(c("M","F"), num_bats, replace = TRUE)
+ages  <- sample(1:10, num_bats, replace = TRUE)
+repro_status <- ifelse(sexes == "F",
+                       sample(c("pregnant", "not_pregnant"), num_bats, replace = TRUE,
+                              prob = c(0.3, 0.7)),
+                       "N/A")
+foraging_strategies <- sample(c("loner", "group_joiner"), num_bats, replace = TRUE)
+competition_rates <- runif(num_bats, 0.1, 0.5)
+initial_roost_indices <- sample(1:nrow(roost_sites), num_bats, replace = TRUE)
+
 bats <- data.frame(
   id = 1:num_bats,
-  x  = roost_sites$x[sample(1:nrow(roost_sites), num_bats, replace = TRUE)],
-  y  = roost_sites$y[sample(1:nrow(roost_sites), num_bats, replace = TRUE)],
-  z  = roost_sites$z[sample(1:nrow(roost_sites), num_bats, replace = TRUE)],
-  calories = rep(100, num_bats),
-  state = rep("to_forage", num_bats),
+  x  = roost_sites$x[initial_roost_indices] + runif(num_bats, -1, 1),
+  y  = roost_sites$y[initial_roost_indices] + runif(num_bats, -1, 1),
+  alive = TRUE,
+  state = "Emergence",
+  sex = sexes,
+  age = ages,
+  reproductive_status = repro_status,
+  BMR = mapply(initialize_bmr, sexes, ages, repro_status),
+  foraging_strategy = foraging_strategies,
+  range_of_vision = rep(shared_range_of_vision, num_bats),
+  competition_rate = competition_rates,
+  calories = 300,
+  max_calories = max_calories_default,
   target_x = NA,
   target_y = NA,
-  target_z = NA,
-  orig_roost_x = NA,
-  orig_roost_y = NA,
-  orig_roost_z = NA
+  orig_roost_x = roost_sites$x[initial_roost_indices],
+  orig_roost_y = roost_sites$y[initial_roost_indices]
 )
 
-# Record each bat's original roost (for later return)
-for (i in 1:nrow(bats)) {
-  bats$orig_roost_x[i] <- bats$x[i]
-  bats$orig_roost_y[i] <- bats$y[i]
-  bats$orig_roost_z[i] <- bats$z[i]
+# Add a memory column: each bat gets a list to record foraging success per cluster.
+bats$memory <- vector("list", nrow(bats))
+for(i in 1:nrow(bats)) {
+  bats$memory[[i]] <- list()  # Keys will be cluster IDs (as characters) with numeric values.
 }
 
-# Initialize bat memory: rows = bats, columns = foraging areas.
-# This memory could represent the cumulative gain from each patch.
-bat_memory <- matrix(0, nrow = num_bats, ncol = num_foraging_areas)
-
-# Initial assignment of targets for foraging: use memory & distance.
-for (i in 1:nrow(bats)) {
-  available <- sapply(foraging_areas, function(fa) { sum(fa$prey) > 0 })
-  if(any(available)) {
-    scores <- rep(0, num_foraging_areas)
-    for(p in 1:num_foraging_areas){
-      if(available[p]){
-        center <- foraging_areas[[p]]$center
-        d <- sqrt((center[1] - bats$x[i])^2 +
-                    (center[2] - bats$y[i])^2 +
-                    (center[3] - bats$z[i])^2)
-        if(d == 0) d <- 0.0001
-        scores[p] <- memory_weight * bat_memory[i, p] + (1 - memory_weight) * (1 / d)
-      }
+##########################################
+# 6. Function: Pick a Cluster for a Bat (Using Memory)
+#    (Chooses a foraging patch based on prey availability, distance, competition, and past success)
+##########################################
+pick_cluster_for_bat <- function(bat_i, bats, cluster_info) {
+  if(all(cluster_info$total_prey <= 0 | (cluster_info$bats_in_cluster >= cluster_info$capacity)))
+    return(NA)
+  
+  best_score <- -Inf
+  best_idx <- NA
+  
+  for(c_i in 1:nrow(cluster_info)) {
+    if(cluster_info$total_prey[c_i] <= 0 || cluster_info$bats_in_cluster[c_i] >= cluster_info$capacity[c_i])
+      next
+    cx <- cluster_info$center_x[c_i]
+    cy <- cluster_info$center_y[c_i]
+    dx <- cx - bats$x[bat_i]
+    dy <- cy - bats$y[bat_i]
+    d <- sqrt(dx^2 + dy^2)
+    if(d == 0) d <- 0.0001
+    cluster_bats <- cluster_info$bats_in_cluster[c_i]
+    strategy <- bats$foraging_strategy[bat_i]
+    comp_val <- if(strategy == "group_joiner") {
+      cluster_bats * bats$competition_rate[bat_i]
+    } else {
+      - cluster_bats * bats$competition_rate[bat_i]
     }
-    chosen <- which.max(scores)
-    chosen_area <- foraging_areas[[chosen]]
-    bats$target_x[i] <- chosen_area$center[1]
-    bats$target_y[i] <- chosen_area$center[2]
-    bats$target_z[i] <- chosen_area$center[3]
-  } else {
-    bats$target_x[i] <- bats$x[i]
-    bats$target_y[i] <- bats$y[i]
-    bats$target_z[i] <- bats$z[i]
+    
+    # Incorporate memory bonus: if the bat has past success in this cluster, add that bonus.
+    mem_bonus <- 0
+    mem_key <- as.character(c_i)
+    if(!is.null(bats$memory[[bat_i]][[mem_key]])) {
+      mem_bonus <- bats$memory[[bat_i]][[mem_key]]
+    }
+    
+    score <- (cluster_info$total_prey[c_i] / d) * 0.5 + comp_val + mem_bonus + runif(1, 0, 0.01)
+    if(score > best_score) {
+      best_score <- score
+      best_idx <- c_i
+    }
   }
+  return(best_idx)
 }
 
-# -------------------------------
-# Helper Function: Move a bat toward its target with a simple repulsion component.
+##########################################
+# 7. Initial Foraging Targets for Each Bat
+#    (Set each bat's target to the center of its chosen cluster, or remain in place)
+##########################################
+
+
+##########################################
+# 8. Movement Function with Random Repulsion 
+#    (Movement is influenced by the desired direction toward the target, repulsion from nearby bats, and age-dependent efficiency)
+##########################################
 move_with_repulsion <- function(i, bats, step, repulsion_radius = 3) {
-  current_pos <- c(bats$x[i], bats$y[i], bats$z[i])
-  target_pos <- c(bats$target_x[i], bats$target_y[i], bats$target_z[i])
+  current_pos <- c(bats$x[i], bats$y[i])
+  target_pos  <- c(bats$target_x[i], bats$target_y[i])
   desired_dir <- target_pos - current_pos
   norm_desired <- sqrt(sum(desired_dir^2))
-  if(norm_desired != 0){
-    desired_dir <- desired_dir / norm_desired
-  }
+  if(norm_desired > 0) desired_dir <- desired_dir / norm_desired
   
-  # Compute repulsion from nearby bats.
-  repulsion <- c(0, 0, 0)
+  repulsion <- c(0, 0)
   for(j in 1:nrow(bats)) {
-    if(j != i) {
-      other_pos <- c(bats$x[j], bats$y[j], bats$z[j])
-      distance <- sqrt(sum((current_pos - other_pos)^2))
-      if(distance < repulsion_radius && distance > 0) {
-        repulsion <- repulsion + (current_pos - other_pos) / (distance^2)
-      }
-    }
+    if(j == i || !bats$alive[j]) next
+    other_pos <- c(bats$x[j], bats$y[j])
+    dist_j <- sqrt(sum((current_pos - other_pos)^2))
+    if(dist_j < repulsion_radius && dist_j > 0)
+      repulsion <- repulsion + (current_pos - other_pos) / (dist_j^2)
   }
-  
   combined <- desired_dir + repulsion
   norm_combined <- sqrt(sum(combined^2))
   if(norm_combined == 0) return(current_pos)
-  new_pos <- current_pos + (combined / norm_combined) * step
+  
+  # Apply age-dependent flight efficiency: older bats move slower (but not below the minimum efficiency)
+  flight_efficiency <- max(min_flight_efficiency, 1 - 0.05 * (bats$age[i] - 1))
+  new_pos <- current_pos + (combined / norm_combined) * step * flight_efficiency
   return(new_pos)
 }
 
-# -------------------------------
-# Set up Plot Limits for a 100x100x100 Canvas
-plot_lim <- list(xlim = c(0, 100), ylim = c(0, 100), zlim = c(0, 100))
+##########################################
+# 9. Setup Plot Limits (2D)
+##########################################
+plot_lim <- list(xlim = c(0, 50000), ylim = c(0, 50000))
 
-# -------------------------------
-# Simulation Loop
-for (t in 1:num_time_steps) {
+##########################################
+# 10. Main Simulation Loop (with Memory, Roosting, & Age-Dependent Behavior)
+##########################################
+
+for(t in 1:num_time_steps) {
   
-  # Update each bat's state and target assignment
-  for (i in 1:nrow(bats)) {
-    if(t >= return_time) {
-      # Returning: check roost occupancy.
-      # Identify the roost the bat would normally return to:
-      orig_roost <- c(bats$orig_roost_x[i], bats$orig_roost_y[i], bats$orig_roost_z[i])
-      
-      # Count occupancy at each roost.
-      roost_occ <- sapply(1:nrow(roost_sites), function(r) {
-        sum(abs(bats$x - roost_sites$x[r]) < tolerance &
-              abs(bats$y - roost_sites$y[r]) < tolerance &
-              abs(bats$z - roost_sites$z[r]) < tolerance)
-      })
-      
-      # Determine the index of the bat's original roost.
-      orig_idx <- which(roost_sites$x == orig_roost[1] &
-                          roost_sites$y == orig_roost[2] &
-                          roost_sites$z == orig_roost[3])
-      
-      # If original roost is too crowded and fidelity is not high, choose alternative.
-      if(roost_occ[orig_idx] > roost_crowd_threshold && runif(1) > roost_fidelity_rate) {
-        alt_idx <- which.min(roost_occ)
-        bats$target_x[i] <- roost_sites$x[alt_idx]
-        bats$target_y[i] <- roost_sites$y[alt_idx]
-        bats$target_z[i] <- roost_sites$z[alt_idx]
-      } else {
-        bats$target_x[i] <- orig_roost[1]
-        bats$target_y[i] <- orig_roost[2]
-        bats$target_z[i] <- orig_roost[3]
-      }
-      bats$state[i] <- "returning"
-      
-    } else {
-      # Not returning: Check if bat is inside any foraging area.
-      in_area <- FALSE
-      for (fa in foraging_areas) {
-        if(bats$x[i] >= fa$bounds$x_range[1] && bats$x[i] <= fa$bounds$x_range[2] &&
-           bats$y[i] >= fa$bounds$y_range[1] && bats$y[i] <= fa$bounds$y_range[2] &&
-           bats$z[i] >= fa$bounds$z_range[1] && bats$z[i] <= fa$bounds$z_range[2]) {
-          in_area <- TRUE
-          current_area <- fa
-          # Record which patch (index) the bat is in.
-          patch_index <- which(sapply(foraging_areas, identical, current_area))
-          break
-        }
-      }
-      
-      if(in_area) {
-        # Inside a foraging area: forage if not full.
-        if(bats$calories[i] < target_calories) {
-          bats$state[i] <- "foraging"
-          bats$target_x[i] <- bats$x[i]
-          bats$target_y[i] <- bats$y[i]
-          bats$target_z[i] <- bats$z[i]
-        } else {
-          bats$state[i] <- "returning"
-          # When switching to returning, use roost rules (handled above on next iteration).
-          bats$target_x[i] <- bats$orig_roost_x[i]
-          bats$target_y[i] <- bats$orig_roost_y[i]
-          bats$target_z[i] <- bats$orig_roost_z[i]
-        }
-      } else {
-        # Not in any foraging area: choose foraging patch based on memory and distance.
-        if(bats$state[i] != "returning") {
-          available <- sapply(foraging_areas, function(fa) { sum(fa$prey) > 0 })
-          if(any(available)) {
-            scores <- rep(0, num_foraging_areas)
-            for(p in 1:num_foraging_areas){
-              if(available[p]){
-                center <- foraging_areas[[p]]$center
-                d <- sqrt((center[1] - bats$x[i])^2 +
-                            (center[2] - bats$y[i])^2 +
-                            (center[3] - bats$z[i])^2)
-                if(d == 0) d <- 0.0001
-                scores[p] <- memory_weight * bat_memory[i, p] + (1 - memory_weight) * (1 / d)
-              }
-            }
-            chosen <- which.max(scores)
-            chosen_area <- foraging_areas[[chosen]]
-            bats$target_x[i] <- chosen_area$center[1]
-            bats$target_y[i] <- chosen_area$center[2]
-            bats$target_z[i] <- chosen_area$center[3]
-            bats$state[i] <- "to_forage"
-          } else {
-            bats$state[i] <- "returning"
-            bats$target_x[i] <- bats$orig_roost_x[i]
-            bats$target_y[i] <- bats$orig_roost_y[i]
-            bats$target_z[i] <- bats$orig_roost_z[i]
-          }
+  # ----- Day-Night Cycle: Determine Time-of-Day -----
+  # We simulate a 24-step day; time_of_day is between 1 and 24.
+  time_of_day <- (t - 1) %% cycle_length + 1
+  is_new_day <- (t %% cycle_length) == 1
+
+if (is_new_day)  {
+  # Randomize new cluster properties
+  cluster_info$center_x <- runif(n_clusters, min = foraging_area_bounds$x_range[1],
+                                 max = foraging_area_bounds$x_range[2])
+  cluster_info$center_y <- runif(n_clusters, min = foraging_area_bounds$y_range[1],
+                                 max = foraging_area_bounds$y_range[2])
+  cluster_info$radius   <- runif(n_clusters, min = 1, max = 10)
+  cluster_info$capacity <- sample(10:20, n_clusters, replace = TRUE)
+  cluster_info$total_prey <- 0
+  cluster_info$bats_in_cluster <- 0
+  
+  # Clear and reset the prey matrix and cluster ID matrix
+  foraging_prey[,] <- 0
+  cluster_id[,] <- 0
+  
+  # Rebuild clusters
+  for(c_i in 1:n_clusters) {
+    rad <- cluster_info$radius[c_i]
+    cx <- cluster_info$center_x[c_i]
+    cy <- cluster_info$center_y[c_i]
+    for(ix in seq_along(x_cells)) {
+      for(iy in seq_along(y_cells)) {
+        dx <- x_cells[ix] - cx
+        dy <- y_cells[iy] - cy
+        dist <- sqrt(dx^2 + dy^2)
+        if(dist <= rad) {
+          dens <- sample(10:35, 1)
+          foraging_prey[ix, iy] <- foraging_prey[ix, iy] + dens
+          cluster_id[ix, iy] <- c_i
+          cluster_info$total_prey[c_i] <- cluster_info$total_prey[c_i] + dens
         }
       }
     }
   }
-  
-  # Move each bat using the move_with_repulsion function and prevent overlap (unless at a roost)
-  for (i in 1:nrow(bats)) {
-    if(!(abs(bats$x[i] - bats$target_x[i]) < tolerance &&
-         abs(bats$y[i] - bats$target_y[i]) < tolerance &&
-         abs(bats$z[i] - bats$target_z[i]) < tolerance)) {
-      new_pos <- move_with_repulsion(i, bats, step = move_step, repulsion_radius = 3)
-      # Check if new_pos is at a roost.
-      is_roost <- any(abs(new_pos[1] - roost_sites$x) < tolerance &
-                        abs(new_pos[2] - roost_sites$y) < tolerance &
-                        abs(new_pos[3] - roost_sites$z) < tolerance)
-      overlap <- FALSE
-      if(!is_roost) {
-        for (j in 1:nrow(bats)) {
-          if(j != i) {
-            dist_between <- sqrt((new_pos[1] - bats$x[j])^2 +
-                                   (new_pos[2] - bats$y[j])^2 +
-                                   (new_pos[3] - bats$z[j])^2)
-            if(dist_between < tolerance) {
-              overlap <- TRUE
-              break
-            }
-          }
-        }
-      }
-      if(!overlap) {
-        bats$x[i] <- new_pos[1]
-        bats$y[i] <- new_pos[2]
-        bats$z[i] <- new_pos[3]
-      }
-    }
-  }
-  
-  # Update calories and perform foraging
-  for (i in 1:nrow(bats)) {
-    bats$calories[i] <- bats$calories[i] - calorie_loss
-    if(bats$state[i] == "foraging") {
-      for (j in seq_along(foraging_areas)) {
-        fa <- foraging_areas[[j]]
-        if(bats$x[i] >= fa$bounds$x_range[1] && bats$x[i] <= fa$bounds$x_range[2] &&
-           bats$y[i] >= fa$bounds$y_range[1] && bats$y[i] <= fa$bounds$y_range[2] &&
-           bats$z[i] >= fa$bounds$z_range[1] && bats$z[i] <= fa$bounds$z_range[2]) {
-          # Map bat's position to cell indices by rounding.
-          cell_x <- as.character(round(bats$x[i]))
-          cell_y <- as.character(round(bats$y[i]))
-          cell_z <- as.character(round(bats$z[i]))
-          if(cell_x %in% dimnames(fa$prey)$x &&
-             cell_y %in% dimnames(fa$prey)$y &&
-             cell_z %in% dimnames(fa$prey)$z) {
-            idx_x <- which(dimnames(fa$prey)$x == cell_x)
-            idx_y <- which(dimnames(fa$prey)$y == cell_y)
-            idx_z <- which(dimnames(fa$prey)$z == cell_z)
-            if(fa$prey[idx_x, idx_y, idx_z] > 0 && bats$calories[i] < target_calories) {
-              gain <- runif(1, min = 2, max = 5)
-              bats$calories[i] <- bats$calories[i] + gain
-              fa$prey[idx_x, idx_y, idx_z] <- fa$prey[idx_x, idx_y, idx_z] - 1
-              foraging_areas[[j]]$prey <- fa$prey
-              # Update bat memory for this patch.
-              bat_memory[i, j] <- bat_memory[i, j] + gain
-            }
-          }
-          break
-        }
-      }
-    }
-  }
-  
-  # -------------------------------
-  # 3D Plotting using rgl
-  rgl::clear3d()
-  plot3d(NA, type = "n", xlim = plot_lim$xlim, ylim = plot_lim$ylim, zlim = plot_lim$zlim,
-         xlab = "X", ylab = "Y", zlab = "Z", main = paste("Time:", t, "minutes"))
-  
-  # Plot roost sites as red spheres.
-  spheres3d(roost_sites$x, roost_sites$y, roost_sites$z, radius = 2, color = "brown")
-  
-  # Plot foraging areas as semi-transparent cubes.
-  for(fa in foraging_areas) {
-    bounds <- fa$bounds
-    cube <- rgl::cube3d(color = "green", alpha = 0.3)
-    cube$vb[1,] <- (cube$vb[1,] + 1)/2 * (bounds$x_range[2] - bounds$x_range[1]) + bounds$x_range[1]
-    cube$vb[2,] <- (cube$vb[2,] + 1)/2 * (bounds$y_range[2] - bounds$y_range[1]) + bounds$y_range[1]
-    cube$vb[3,] <- (cube$vb[3,] + 1)/2 * (bounds$z_range[2] - bounds$z_range[1]) + bounds$z_range[1]
-    rgl::shade3d(cube, col = "green", alpha = 0.3)
-  }
-  
-  # Plot bats as spheres.
-  spheres3d(bats$x, bats$y, bats$z, radius = 1, color = "grey")
-  
-  Sys.sleep(0.05)
 }
+  
+
+  
+ 
+   return_window <- 500  # Number of time steps before sunrise bats try to return
+   
+   returning_time <- time_of_day >= (sunrise - return_window) & time_of_day < sunrise
+   if(returning_time) {
+     bats$target_x[i] <- bats$orig_roost_x[i]
+     bats$target_y[i] <- bats$orig_roost_y[i]
+     bats$state[i] <- "Returning"
+   }
+  
+  # During daytime (from sunset to sunrise), bats roost.
+  if(time_of_day >= sunrise & time_of_day < sunset) {
+    for(i in 1:nrow(bats)) {
+      if(bats$alive[i]) {
+        bats$state[i] <- "Roosting"
+        # Move bat near the roost (with slight jitter).
+        bats$x[i] <- roost_sites$x[1]
+        bats$y[i] <- roost_sites$y[1]
+        # Apply a lower metabolic cost while roosting.
+        bats$calories[i] <- bats$calories[i] - (calorie_loss_per_step * 0.5)
+      }
+    }
+    # Optionally, decay memory during the day as well.
+    for(i in 1:nrow(bats)) {
+      if(length(bats$memory[[i]]) > 0) {
+        for(mem_key in names(bats$memory[[i]])) {
+          bats$memory[[i]][[mem_key]] <- bats$memory[[i]][[mem_key]] * 0.99
+        }
+      }
+    }
+    next  # Skip the rest of the loop (foraging, movement, etc.) during roosting hours.
+  }
+  
+  # ----- Nighttime: Foraging, Movement, and Energy Updates -----
+  # Update states and choose foraging clusters for each bat.
+   # ----- Nighttime: Foraging, Movement, and Energy Updates -----
+   # Update states and choose foraging clusters for each bat.
+   for(i in 1:nrow(bats)) {
+     if(!bats$alive[i]) next
+     
+     # Check for death from starvation.
+     if(bats$calories[i] <= calorie_death_threshold) {
+       bats$alive[i] <- FALSE
+       bats$state[i] <- "Dead"
+       next
+     }
+     # If the bat is full, return to roost
+     if(bats$calories[i] >= bats$max_calories[i]) {
+       bats$target_x[i] <- bats$orig_roost_x[i]
+       bats$target_y[i] <- bats$orig_roost_y[i]
+       bats$state[i] <- "Returning"
+       next
+     }
+     
+     # If it's return time, go home.
+     if(returning_time) {
+       bats$target_x[i] <- bats$orig_roost_x[i]
+       bats$target_y[i] <- bats$orig_roost_y[i]
+       bats$state[i] <- "Returning"
+       next
+     }
+     
+     # Normal nighttime foraging behavior
+     bats$state[i] <- "Foraging"
+     
+     # If the bat is on a cell with prey, it stays in place.
+     x_int <- round(bats$x[i])
+     y_int <- round(bats$y[i])
+     if(x_int %in% x_cells && y_int %in% y_cells) {
+       ix <- which(x_cells == x_int)
+       iy <- which(y_cells == y_int)
+       if(foraging_prey[ix, iy] > 0) {
+         bats$target_x[i] <- bats$x[i]
+         bats$target_y[i] <- bats$y[i]
+         next
+       }
+     }
+     
+     # Choose a foraging cluster
+     c_idx <- pick_cluster_for_bat(i, bats, cluster_info)
+     if(is.na(c_idx)) {
+       bats$state[i] <- "Returning"
+       bats$target_x[i] <- bats$orig_roost_x[i]
+       bats$target_y[i] <- bats$orig_roost_y[i]
+     } else {
+       bats$target_x[i] <- cluster_info$center_x[c_idx]
+       bats$target_y[i] <- cluster_info$center_y[c_idx]
+     }
+   }
+   
+  
+  # Movement Update: Each bat moves toward its target (if not already there).
+  for(i in 1:nrow(bats)) {
+    if(!bats$alive[i] || bats$state[i] == "Dead") next
+    if(abs(bats$x[i] - bats$target_x[i]) < tolerance &&
+       abs(bats$y[i] - bats$target_y[i]) < tolerance) {
+      next
+    }
+    new_pos <- move_with_repulsion(i, bats, step = move_step, repulsion_radius = 4)
+    
+    # Check for overlap or collision.
+    is_roost <- any(
+      abs(new_pos[1] - roost_sites$x) < tolerance &
+        abs(new_pos[2] - roost_sites$y) < tolerance
+    )
+    overlap <- FALSE
+    if(!is_roost) {
+      for(j in 1:nrow(bats)) {
+        if(j == i || !bats$alive[j]) next
+        dist_j <- sqrt((new_pos[1] - bats$x[j])^2 +
+                         (new_pos[2] - bats$y[j])^2)
+        if(dist_j < tolerance) {
+          overlap <- TRUE
+          break
+        }
+      }
+    }
+    if(!overlap) {
+      bats$x[i] <- new_pos[1]
+      bats$y[i] <- new_pos[2]
+    }
+  }
+   
+   if(movie) {
+     jpeg(filename = paste0(movie_dir, "/frame", formatC(t, width = 5, format = "d", flag = "0"), ".jpg"),
+          width = 480, height = 480, units = "px", quality = 75, bg = "white")
+   }
+  
+  # Foraging & Calorie Update: Bats lose energy due to metabolism and then forage to gain energy.
+  cluster_info$bats_in_cluster <- 0
+  for(i in 1:nrow(bats)) {
+    if(!bats$alive[i] || bats$state[i] == "Dead") next
+    
+    # Subtract metabolic cost.
+    effective_loss <- calorie_loss_per_step * bats$BMR[i]
+    bats$calories[i] <- bats$calories[i] - effective_loss
+    
+    x_int <- round(bats$x[i])
+    y_int <- round(bats$y[i])
+    if(x_int %in% x_cells && y_int %in% y_cells) {
+      ix <- which(x_cells == x_int)
+      iy <- which(y_cells == y_int)
+      c_id <- cluster_id[ix, iy]
+      if(c_id > 0) {
+        cluster_info$bats_in_cluster[c_id] <- cluster_info$bats_in_cluster[c_id] + 1
+        if(foraging_prey[ix, iy] > 0 && bats$calories[i] < bats$max_calories[i]) {
+          foraging_efficiency <- max(min_foraging_efficiency, 1 - 0.03 * (bats$age[i] - 1))
+          gain <- runif(1, 2, 5) * foraging_efficiency
+          new_cal <- min(bats$calories[i] + gain, bats$max_calories[i])
+          actual_gain <- new_cal - bats$calories[i]
+          if(foraging_prey[ix, iy] < actual_gain) {
+            actual_gain <- foraging_prey[ix, iy]
+            new_cal <- bats$calories[i] + actual_gain
+          }
+          foraging_prey[ix, iy] <- max(0, foraging_prey[ix, iy] - actual_gain)
+          cluster_info$total_prey[c_id] <- max(0, cluster_info$total_prey[c_id] - actual_gain)
+          bats$calories[i] <- new_cal
+          
+          # Memory Update: Record the foraging success for this cluster.
+          mem_key <- as.character(c_id)
+          if(is.null(bats$memory[[i]][[mem_key]])) {
+            bats$memory[[i]][[mem_key]] <- actual_gain
+          } else {
+            bats$memory[[i]][[mem_key]] <- bats$memory[[i]][[mem_key]] + actual_gain
+          }
+        }
+      }
+    }
+  }
+  
+  plot(NA, xlim = plot_lim$xlim, ylim = plot_lim$ylim,
+       xlab = "X", ylab = "Y", main = paste("Time:", t, "steps"), asp = 1)
+  
+
+  # Plot roost sites (brown).
+  points(roost_sites$x, roost_sites$y, pch = 19, col = "brown", cex = 2)
+  
+  # Draw the foraging area boundary.
+  rect(foraging_area_bounds$x_range[1], foraging_area_bounds$y_range[1],
+       foraging_area_bounds$x_range[2], foraging_area_bounds$y_range[2],
+       border = "green", lwd = 2)
+  
+  # Plot each foraging cluster as a semi-transparent blue circle.
+  for(c_i in 1:n_clusters) {
+    rad <- cluster_info$radius[c_i]
+    if(rad > 0) {
+      symbols(cluster_info$center_x[c_i], cluster_info$center_y[c_i],
+              circles = rad, inches = FALSE, add = TRUE,
+              fg = "blue", bg = rgb(0, 0, 1, alpha = 0.15))
+    }
+  }
+  
+  # Plot living bats in grey and dead bats in black.
+  alive_idx <- which(bats$alive)
+  dead_idx  <- which(!bats$alive)
+  if(length(alive_idx) > 0)
+    points(bats$x[alive_idx], bats$y[alive_idx], pch = 19, col = "grey")
+  if(length(dead_idx) > 0)
+    points(bats$x[dead_idx], bats$y[dead_idx], pch = 19, col = "black")
+  
+  if(movie) dev.off()
+  
+  Sys.sleep(0.03)
+}
+
+#unlink("movie_frames", recursive = TRUE)
+
+### Create Movie from Frames (Animated GIF using the magick package)
+library(magick)
+img_files <- list.files("movie_frames", pattern = "^frame\\d+\\.jpg$", full.names = TRUE)
+frames <- image_read(img_files)
+animation <- image_animate(frames, fps = 10)
+image_write(animation, "output.gif")
+
+
 
