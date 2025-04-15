@@ -13,15 +13,15 @@ gc()
 ###########################################
 num_time_steps         <- 5000    # Total simulation steps (iterations)
 num_bats               <- 100     # Initial number of bats
-move_step              <- 1       # Basic movement distance per time step
+move_step              <- 59       # Basic movement distance per time step
 tolerance              <- 0.1     # Spatial threshold for "arrival" and collision checks
 
 # Energy and metabolic rate references:
 calorie_death_threshold <- 0      # Energy level at which a bat dies (starvation)
 max_calories_default    <- 300    # Maximum energy a bat can store
-
+calorie_loss_per_step   <- 5
 # Shared sensory range (all bats use the same detection distance)
-shared_range_of_vision <- 20
+shared_range_of_vision  <- 20
 
 ###########################################
 # Additional Life-History Parameters
@@ -507,7 +507,7 @@ for(t in 1:num_time_steps) {
     rad <- cluster_info$radius[c_i]
     if(rad > 0) {
       symbols(cluster_info$center_x[c_i], cluster_info$center_y[c_i],
-              circles = rad, inches = FALSE, add = TRUE,
+              circles = rad * 5, inches = FALSE, add = TRUE,
               fg = "blue", bg = rgb(0, 0, 1, alpha = 0.15))
     }
   }
@@ -516,9 +516,7 @@ for(t in 1:num_time_steps) {
   alive_idx <- which(bats$alive)
   dead_idx  <- which(!bats$alive)
   if(length(alive_idx) > 0)
-    points(bats$x[alive_idx], bats$y[alive_idx], pch = 19, col = "grey")
+    points(bats$x[alive_idx], bats$y[alive_idx], pch = 19, col = "grey", cex = 0.25)
   if(length(dead_idx) > 0)
     points(bats$x[dead_idx], bats$y[dead_idx], pch = 19, col = "black")
-  
-  Sys.sleep(0.03)
-}
+  }
